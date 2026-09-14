@@ -15,7 +15,7 @@ pub fn run() {
     }
 
     let db = PebbleDB::open(DEFAULT_DB_PATH);
-    let mut db = match db {
+    let db = match db {
         Ok(db) => db,
         Err(e) => {
             eprintln!("Error opening database: {}", e);
@@ -94,6 +94,7 @@ pub fn run() {
             let stats = db.stats();
             println!("Memtable");
             println!("  entries:       {}", stats.memtable_entries);
+            println!("  bytes:         {}", stats.memtable_bytes);
             println!("SSTables");
             println!("  count:         {}", stats.sst_count);
             println!("  total size:    {} bytes", stats.total_sst_size);
@@ -102,6 +103,11 @@ pub fn run() {
             }
             println!("WAL");
             println!("  size:          {} bytes", stats.wal_size);
+            println!("Performance Counters");
+            println!("  memtable hits: {}", stats.memtable_hits);
+            println!("  bloom rejects: {}", stats.bloom_rejects);
+            println!("  block reads:   {}", stats.block_reads);
+            println!("  compactions:   {}", stats.compactions_completed);
         }
         _ => {
             eprintln!("Unknown command: {}", command);
