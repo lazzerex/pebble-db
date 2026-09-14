@@ -2,109 +2,112 @@ use std::time::Instant;
 
 use pebbledb::db::PebbleDB;
 
+fn bench(name: &str, iterations: usize, f: impl Fn(usize)) {
+    let start = Instant::now();
+    for i in 0..iterations {
+        f(i);
+    }
+    let elapsed = start.elapsed();
+    let ops_sec = (iterations as f64 / elapsed.as_secs_f64()) as u64;
+    println!("  {:<12} {:>8.2?}  ({} ops/sec)", name, elapsed, ops_sec);
+}
+
 fn main() {
     let iterations = 1_000;
 
-    println!("PebbleDB Benchmark");
-    println!("{} operations per test\n", iterations);
+    println!("=== PebbleDB Benchmark ===\n");
 
+    // --- Memtable only (no flush) ---
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("bench_memtable");
-    let mut db = PebbleDB::open_with_threshold(&path, usize::MAX).unwrap();
+    let db = PebbleDB::open_with_threshold(&path, usize::MAX).unwrap();
 
-    let start = Instant::now();
-    for i in 0..iterations {
+    println!("Memtable only (no flush, {} ops):", iterations);
+    bench("SET", iterations, |i| {
         db.set(format!("key_{:06}", i), format!("value_{}", i))
             .unwrap();
-    }
-    let set_time = start.elapsed();
-
-    let start = Instant::now();
-    for i in 0..iterations {
+    });
+    bench("GET", iterations, |i| {
         db.get(&format!("key_{:06}", i)).unwrap();
-    }
-    let get_time = start.elapsed();
-
-    let start = Instant::now();
-    for i in 0..iterations {
+    });
+    bench("MIXED", iterations, |i| {
         if i % 2 == 0 {
             db.set(format!("key_{:06}", i), format!("updated_{}", i))
                 .unwrap();
         } else {
             db.get(&format!("key_{:06}", i)).unwrap();
         }
-    }
-    let mixed_time = start.elapsed();
-
-    println!("Memtable only (no flush):");
+    });
+    let stats = db.stats();
     println!(
-        "  SET:     {:?} ({} ops/sec)",
-        set_time,
-        (iterations as f64 / set_time.as_secs_f64()) as u64
+        "  Bloom rejects: {}, Block reads: {}\n",
+        stats.bloom_rejects, stats.block_reads
     );
-    println!(
-        "  GET:     {:?} ({} ops/sec)",
-        get_time,
-        (iterations as f64 / get_time.as_secs_f64()) as u64
-    );
-    println!(
-        "  MIXED:   {:?} ({} ops/sec)",
-        mixed_time,
-        (iterations as f64 / mixed_time.as_secs_f64()) as u64
-    );
-
     db.close().unwrap();
 
-    println!();
-
+    // --- SSTable-backed ---
     let dir2 = tempfile::tempdir().unwrap();
     let path2 = dir2.path().join("bench_sstable");
-    let mut db2 = PebbleDB::open_with_threshold(&path2, 500).unwrap();
+    let db2 = PebbleDB::open_with_threshold(&path2, 500).unwrap();
 
-    let start = Instant::now();
-    for i in 0..iterations {
+    println!("SSTable-backed (threshold=500, {} ops):", iterations);
+    bench("SET", iterations, |i| {
         db2.set(format!("key_{:06}", i), format!("value_{}", i))
             .unwrap();
-    }
-    let set_time = start.elapsed();
-
-    let start = Instant::now();
-    for i in 0..iterations {
+    });
+    bench("GET", iterations, |i| {
         db2.get(&format!("key_{:06}", i)).unwrap();
-    }
-    let get_time = start.elapsed();
-
-    let start = Instant::now();
-    for i in 0..iterations {
+    });
+    bench("MIXED", iterations, |i| {
         if i % 2 == 0 {
             db2.set(format!("key_{:06}", i), format!("updated_{}", i))
                 .unwrap();
         } else {
             db2.get(&format!("key_{:06}", i)).unwrap();
         }
-    }
-    let mixed_time = start.elapsed();
-
+    });
     let stats = db2.stats();
-
-    println!("SSTable-backed (threshold=500):");
-    println!(
-        "  SET:     {:?} ({} ops/sec)",
-        set_time,
-        (iterations as f64 / set_time.as_secs_f64()) as u64
-    );
-    println!(
-        "  GET:     {:?} ({} ops/sec)",
-        get_time,
-        (iterations as f64 / get_time.as_secs_f64()) as u64
-    );
-    println!(
-        "  MIXED:   {:?} ({} ops/sec)",
-        mixed_time,
-        (iterations as f64 / mixed_time.as_secs_f64()) as u64
-    );
     println!(
         "  SSTables: {}, Total size: {} bytes",
         stats.sst_count, stats.total_sst_size
     );
+    println!(
+        "  Bloom rejects: {}, Block reads: {}\n",
+        stats.bloom_rejects, stats.block_reads
+    );
+    db2.close().unwrap();
+
+    // --- Concurrent access ---
+    let dir3 = tempfile::tempdir().unwrap();
+    let path3 = dir3.path().join("bench_concurrent");
+    let db3 = PebbleDB::open_with_threshold(&path3, usize::MAX).unwrap();
+
+    let threads = 4;
+    let ops_per_thread = iterations / threads;
+    println!(
+        "Concurrent ({} threads, {} ops each):",
+        threads, ops_per_thread
+    );
+
+    let start = Instant::now();
+    let mut handles = Vec::new();
+    for t in 0..threads {
+        let db = db3.clone();
+        handles.push(std::thread::spawn(move || {
+            for i in 0..ops_per_thread {
+                let key = format!("t{}_{:06}", t, i);
+                db.set(key.clone(), format!("value_{}", i)).unwrap();
+                db.get(&key).unwrap();
+            }
+        }));
+    }
+    for h in handles {
+        h.join().unwrap();
+    }
+    let elapsed = start.elapsed();
+    let total_ops = threads * ops_per_thread;
+    let ops_sec = (total_ops as f64 / elapsed.as_secs_f64()) as u64;
+    println!("  Total:       {:>8.2?}  ({} ops/sec)", elapsed, ops_sec);
+
+    db3.close().unwrap();
 }
