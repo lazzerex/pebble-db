@@ -2,7 +2,7 @@
 
 A small educational persistent key-value database written in Rust.
 
-PebbleDB exists to demonstrate how a storage engine works internally. It implements an LSM-tree style architecture with a WAL, memtable, SSTables, bloom filters, and concurrent access via RwLock.
+PebbleDB exists to demonstrate how a storage engine works internally. It implements an LSM-tree style architecture with a WAL, memtable, leveled SSTables, bloom filters, and concurrent access via RwLock.
 
 ## Architecture
 
@@ -15,24 +15,27 @@ PebbleDB exists to demonstrate how a storage engine works internally. It impleme
                   +----+----+
                        |
                        v
-                  +---------+
+                  +----------+
                   | Memtable |  <-- RwLock for concurrent access
-                  +----+----+
+                  +----+-----+
                        | flush
                        v
-              +-----------------+
-              |    SSTable v2   |
-              +-----------------+
-              | Block Index     |  <-- sparse index: first_key -> block offset
-              | Bloom Filter    |  <-- probabilistic rejection of absent keys
-              | sorted blocks   |  <-- fixed-size blocks for efficient reads
-              +-----------------+
+                  L0  [SSTable] [SSTable]   <-- newest level, files may overlap
+                       | compaction
+                       v
+                  L1  [SSTable] [SSTable]   <-- files within a level never overlap
+                       | compaction
+                       v
+                  L2  [SSTable]
+                       |
+                      ...
 ```
 
 - **CLI** parses commands and calls the database layer.
 - **DB** manages the in-memory memtable behind an `RwLock<DbInner>` for thread-safe concurrent reads/writes. Tracks performance counters (memtable hits, bloom rejects, block reads, compactions).
 - **WAL** provides append-only logging with CRC32 checksums for crash recovery.
-- **SSTables** are immutable block-based on-disk files with a sparse index and bloom filter for fast lookups.
+- **SSTables** are immutable block-based on-disk files with a sparse index and bloom filter for fast lookups. Each file belongs to a level (L0, L1, L2, ...) encoded in its filename.
+- **Leveled Compaction** keeps files within each level sorted and non-overlapping. When L0 exceeds the compaction threshold its files are merged with overlapping L1 files into new L1 files. If the resulting L1 exceeds its size budget the oldest oversized file cascades into L2, and so on. Tombstones are dropped when they reach the deepest level that still holds the key.
 - **Bloom Filter** per SSTable rejects lookups for keys that definitely don't exist, avoiding unnecessary disk reads.
 - **Iterators** provide ordered, lazy access to a single source (memtable or SSTable) and a merge iterator combines them into one ascending view for range queries.
 
@@ -52,16 +55,15 @@ GET key
 Memtable  -->  found?  -->  return value (or None if tombstone)
   |
   v (not found)
-For each SSTable (newest first):
-  Bloom filter  -->  might_contain?  -->  skip if definitely absent
-  Block index   -->  find target block
-  Binary search block  -->  found?  -->  return value (or None if tombstone)
+Level 0  [SSTable] ...  -->  newest first within level
+Level 1  [SSTable] ...
+Level 2  [SSTable] ...
   |
-  v (not found)
+  v
 None
 ```
 
-The most recent write always wins. If the newest matching record is a tombstone, the key is considered deleted. Bloom filters skip SSTables that definitely don't contain the key.
+The read path walks the memtable first, then SSTables level by level (L0 newest-first, then L1, L2, ...) and returns the first matching record. Within L0 files may overlap so every file is checked. From L1 onward files within each level are sorted and non-overlapping, so a single file per level is sufficient once the key range is known. If the newest matching record is a tombstone the key is considered deleted. Bloom filters still serve point `get` only: an ordered seek must find the next existing key, so the absence of a key does
 
 ## Range Reads
 
@@ -217,6 +219,28 @@ The database is consistent after replay because:
 
 Each `set` and `delete` call writes to the WAL and calls `fsync` before returning success. SSTables are written to a temp file and atomically renamed with fsync.
 
+## Compaction Strategy
+
+PebbleDB uses leveled compaction to bound read amplification and reclaim space:
+
+```text
+  flush_threshold     -- memtable entries before flushing to a new L0 file
+  l0_compaction_threshold -- L0 file count that triggers L0 -> L1 compaction
+  target_level_size   -- size budget of L1 in bytes
+  level_size_multiplier -- growth factor for deeper levels (clamped to >= 2)
+  target_file_size    -- approximate bytes per compaction output file
+```
+
+**L0 -> L1 compaction** is triggered when the number of L0 files reaches `l0_compaction_threshold`. All L0 files are merged with any L1 files whose key range overlaps. The output is written to L1 in non-overlapping file segments of at most `target_file_size` bytes each.
+
+**Cascade** happens after every flush: if a level's total size exceeds its budget (`target_level_size * multiplier^(level - 1)`), the oldest oversized file is merged with its overlapping neighbors in the next level. Cascades repeat until every level is within budget or the deepest level absorbs everything.
+
+**Tombstone handling**: tombstones are kept while a deeper level holds data that they might shadow. When all overlapping files live in the deepest level containing that key, the tombstone is dropped and the dead data is reclaimed.
+
+**Crash safety** follows the same atomic-rename protocol used by flushes: compaction output is written to a `.sst.tmp` file, fsynced, then renamed into place. Input files are deleted only after all outputs are durable. On startup orphaned `.sst.tmp` files are removed, and any leftover input/output duplicates are resolved by the next compaction cycle.
+
+`compact()` runs the leveled compaction loop until no level needs work. `compact_full()` is a legacy baseline that merges every SSTable into a single file at level 1.
+
 ## Commands
 
 ```text
@@ -246,6 +270,10 @@ Memtable
 SSTables
   count:         0
   total size:    0 bytes
+  levels:
+    L0           0 files
+    L1           0 files
+    L2           0 files
 WAL
   size:          27 bytes
 Performance Counters
@@ -253,6 +281,8 @@ Performance Counters
   bloom rejects: 0
   block reads:   0
   compactions:   0
+  full compactions: 0
+  write amplification: --
 $ pebbledb compact
 OK
 ```
@@ -264,13 +294,14 @@ cargo build
 cargo test
 ```
 
-88 unit tests covering:
+114 unit tests covering:
 - WAL round-trip, incomplete records, checksum corruption
 - Bloom filter insert, lookup, false positives, encode/decode
 - SSTable v2 block-based format, sparse index, bloom filter, checksum validation
 - Memtable flushing and SSTable creation
 - Read path: memtable override, SSTable lookup, bloom rejection, tombstone behavior
-- Compaction: merge, deduplication, tombstone cleanup
+- Compaction policy: level size budgets, L0 threshold, cascade cascading, tombstone handling, file splitting, non-overlap invariants, overlap tolerance, deterministic picker
+- Leveled compaction DB tests: flush to L0, threshold trigger, L0/L1 overlap, L1 non-overlap, multi-level cascade, tombstone retention/removal, recovery, legacy filenames, partial-compaction crash duplicates, temp-file cleanup, metrics, full-compaction baseline, concurrent reads
 - Crash recovery: WAL replay after flush, temp file cleanup
 - Concurrent set/get from multiple threads
 - Scan ordering, stats with counters
@@ -297,5 +328,5 @@ Benchmarks three scenarios:
 - Iteration is ascending only; there is no reverse iterator.
 - A range iterator copies the memtable into memory when it is created (bounded by the flush threshold). `SSTable::load` already keeps each SSTable file in memory; the iterator decodes one block at a time instead of materialising every entry.
 - Bloom filters are not used for ordered seeks, because finding the successor of a missing key still requires reading a block.
-- Compaction is a simple full merge; no leveled or tiered strategy.
+- Compaction runs synchronously on the flush path (no background thread).
 - Bloom filter false positive rate ~1% (10 bits/key, 7 hash functions).
