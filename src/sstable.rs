@@ -34,12 +34,15 @@ pub struct SSTable {
     bloom: BloomFilter,
     record_count: usize,
     block_count: usize,
+    last_key: Option<String>,
 }
 
 impl SSTable {
     pub fn load(id: u64, path: &Path) -> Result<Self> {
         let data = fs::read(path)?;
-        Self::parse(id, path, data)
+        let mut sst = Self::parse(id, path, data)?;
+        sst.derive_last_key();
+        Ok(sst)
     }
 
     fn parse(id: u64, path: &Path, data: Vec<u8>) -> Result<Self> {
@@ -104,7 +107,17 @@ impl SSTable {
             bloom,
             record_count,
             block_count,
+            last_key: None,
         })
+    }
+
+    fn derive_last_key(&mut self) {
+        let Some(last_block) = self.index.len().checked_sub(1) else {
+            return;
+        };
+        self.last_key = self
+            .read_block(last_block)
+            .and_then(|entries| entries.last().map(|(key, _)| key.clone()));
     }
 
     fn parse_index(data: &[u8]) -> Result<Vec<IndexEntry>> {
@@ -241,6 +254,10 @@ impl SSTable {
 
     pub fn first_key(&self) -> Option<&str> {
         self.index.first().map(|e| e.first_key.as_str())
+    }
+
+    pub fn key_range(&self) -> Option<(&str, &str)> {
+        Some((self.first_key()?, self.last_key.as_deref()?))
     }
 
     pub fn bloom_might_contain(&self, key: &str) -> bool {
