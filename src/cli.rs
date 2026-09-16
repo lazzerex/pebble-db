@@ -98,8 +98,8 @@ pub fn run() {
             println!("SSTables");
             println!("  count:         {}", stats.sst_count);
             println!("  total size:    {} bytes", stats.total_sst_size);
-            for (id, size) in &stats.sst_sizes {
-                println!("  sst_{}:        {} bytes", id, size);
+            for level in &stats.levels {
+                println!("  L{}:           {} files", level.level, level.files);
             }
             println!("WAL");
             println!("  size:          {} bytes", stats.wal_size);
@@ -108,6 +108,11 @@ pub fn run() {
             println!("  bloom rejects: {}", stats.bloom_rejects);
             println!("  block reads:   {}", stats.block_reads);
             println!("  compactions:   {}", stats.compactions_completed);
+            println!("  full compactions: {}", stats.full_compactions);
+            match stats.write_amplification {
+                Some(wa) => println!("  write amplification: {:.2}", wa),
+                None => println!("  write amplification: --"),
+            }
         }
         _ => {
             eprintln!("Unknown command: {}", command);
