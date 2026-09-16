@@ -5,10 +5,6 @@ use std::sync::Arc;
 use crate::db::MemtableEntry;
 use crate::sstable::{SSTable, SSTableEntry};
 
-/// Ordered cursor over a single key-space source served in ascending key order.
-///
-/// A tombstone is reported as a valid key with no value; use [`StorageIterator::valid`]
-/// to distinguish an exhausted iterator from a deleted entry.
 pub trait StorageIterator {
     fn seek_to_first(&mut self);
     fn seek(&mut self, target: &str);
@@ -98,7 +94,6 @@ impl SSTableIterator {
         self.index = 0;
     }
 
-    /// Moves to the next block while the current one is exhausted.
     fn ensure_entry(&mut self) -> bool {
         while self.index >= self.entries.len() {
             if self.block + 1 >= self.sst.block_count() {
@@ -147,14 +142,10 @@ impl StorageIterator for SSTableIterator {
     }
 }
 
-/// Merges several sources ordered from newest to oldest.
-///
-/// Keys are emitted once, in ascending order, using the value of the newest source
-/// that contains them. A tombstone in the newest source hides older values and is
-/// never emitted, so a merged iterator only yields live entries.
 pub struct MergeIterator {
     children: Vec<Box<dyn StorageIterator>>,
     current: Option<CurrentEntry>,
+    keep_tombstones: bool,
 }
 
 struct CurrentEntry {
@@ -163,14 +154,22 @@ struct CurrentEntry {
 }
 
 impl MergeIterator {
-    /// Builds the merged iterator positioned on the smallest live key.
-    pub fn new(mut children: Vec<Box<dyn StorageIterator>>) -> Self {
+    pub fn new(children: Vec<Box<dyn StorageIterator>>) -> Self {
+        Self::build(children, false)
+    }
+
+    pub fn new_with_tombstones(children: Vec<Box<dyn StorageIterator>>) -> Self {
+        Self::build(children, true)
+    }
+
+    fn build(mut children: Vec<Box<dyn StorageIterator>>, keep_tombstones: bool) -> Self {
         for child in &mut children {
             child.seek_to_first();
         }
         let mut merged = Self {
             children,
             current: None,
+            keep_tombstones,
         };
         merged.normalize();
         merged
@@ -182,7 +181,7 @@ impl MergeIterator {
                 self.current = None;
                 return;
             };
-            if self.children[source].value().is_some() {
+            if self.keep_tombstones || self.children[source].value().is_some() {
                 self.current = Some(CurrentEntry { key, source });
                 return;
             }
@@ -249,14 +248,12 @@ impl StorageIterator for MergeIterator {
     }
 }
 
-/// Ascending iterator over the live keys of a database between two bounds.
 pub struct RangeIterator {
     merged: MergeIterator,
     end: Bound<String>,
 }
 
 impl RangeIterator {
-    /// Positions the iterator on the first live key that satisfies `start`.
     pub fn new(merged: MergeIterator, start: Bound<String>, end: Bound<String>) -> Self {
         let mut iter = Self { merged, end };
         match start {
@@ -289,7 +286,6 @@ impl StorageIterator for RangeIterator {
         self.merged.seek_to_first();
     }
 
-    /// Seeks to the first live key greater than or equal to `target`.
     fn seek(&mut self, target: &str) {
         self.merged.seek(target);
     }
@@ -637,6 +633,21 @@ mod tests {
             vec![Box::new(MemtableIterator::new(&newest)), Box::new(older)];
         let mut iter = MergeIterator::new(children);
         assert_eq!(drain(&mut iter), pairs(&[("b", Some("kept"))]));
+    }
+
+    #[test]
+    fn merge_with_tombstones_keeps_deleted_keys() {
+        let newest = memtable(&[("a", None), ("b", Some("2"))]);
+        let older = memtable(&[("a", Some("old")), ("c", Some("3"))]);
+        let children: Vec<Box<dyn StorageIterator>> = vec![
+            Box::new(MemtableIterator::new(&newest)),
+            Box::new(MemtableIterator::new(&older)),
+        ];
+        let mut iter = MergeIterator::new_with_tombstones(children);
+        assert_eq!(
+            drain(&mut iter),
+            pairs(&[("a", None), ("b", Some("2")), ("c", Some("3"))])
+        );
     }
 
     fn range_iter(
