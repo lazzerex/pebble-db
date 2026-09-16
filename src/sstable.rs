@@ -148,7 +148,7 @@ impl SSTable {
         None
     }
 
-    fn find_block(&self, key: &str) -> Option<usize> {
+    pub(crate) fn find_block(&self, key: &str) -> Option<usize> {
         let mut result = 0;
         for (i, entry) in self.index.iter().enumerate() {
             if entry.first_key.as_str() <= key {
@@ -160,7 +160,7 @@ impl SSTable {
         Some(result)
     }
 
-    fn read_block(&self, idx: usize) -> Option<Vec<(String, SSTableEntry)>> {
+    pub(crate) fn read_block(&self, idx: usize) -> Option<Vec<(String, SSTableEntry)>> {
         let entry = self.index.get(idx)?;
         let start = entry.block_offset as usize;
         let end = start + entry.block_size as usize;
