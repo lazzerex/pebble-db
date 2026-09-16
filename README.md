@@ -34,6 +34,7 @@ PebbleDB exists to demonstrate how a storage engine works internally. It impleme
 - **WAL** provides append-only logging with CRC32 checksums for crash recovery.
 - **SSTables** are immutable block-based on-disk files with a sparse index and bloom filter for fast lookups.
 - **Bloom Filter** per SSTable rejects lookups for keys that definitely don't exist, avoiding unnecessary disk reads.
+- **Iterators** provide ordered, lazy access to a single source (memtable or SSTable) and a merge iterator combines them into one ascending view for range queries.
 
 ## Write Path
 
@@ -61,6 +62,65 @@ None
 ```
 
 The most recent write always wins. If the newest matching record is a tombstone, the key is considered deleted. Bloom filters skip SSTables that definitely don't contain the key.
+
+## Range Reads
+
+Range queries reuse the same ordering rule as point reads:
+
+```text
+RANGE start..end
+      |
+      v
+  MergeIterator
+      +-- MemtableIterator   <-- newest writes
+      +-- SSTableIterator    <-- newest SSTable first
+      +-- SSTableIterator
+      ...
+      |
+      v
+  RangeIterator  -->  ascending (key, value) pairs
+```
+
+Each source exposes an ordered cursor. On a seek the sparse index locates the block whose first key is the largest one `<= target`, and only that block is read, so a seek never scans the whole SSTable. The merge iterator keeps one cursor per source, always emits the smallest remaining key, prefers the newest source when the same key exists in several sources, and drops any key whose newest record is a tombstone.
+
+Bloom filters still serve point `get` only: an ordered seek must find the next existing key, so the absence of a key does not end the scan.
+
+## Iteration and Range Queries
+
+`PebbleDB::range` accepts any `RangeBounds<String>` and returns a `RangeIterator` yielding `(key, value)` pairs in ascending key order:
+
+```rust
+use pebbledb::db::PebbleDB;
+
+let db = PebbleDB::open(".pebbledb").unwrap();
+db.set("a".into(), "1".into()).unwrap();
+db.set("b".into(), "2".into()).unwrap();
+db.set("c".into(), "3".into()).unwrap();
+
+for (key, value) in db.range("a".to_string().."c".to_string()) {
+    println!("{} = {}", key, value);
+}
+// a = 1
+// b = 2
+
+let one = db.range("b".to_string()..="b".to_string()).collect::<Vec<_>>();
+// [("b".to_string(), "2".to_string())]
+```
+
+Supported bounds: `..` (everything), `start..`, `..end`, `start..end` and `start..=end`. A key whose newest record is a tombstone is never returned. `scan()` and `keys()` are implemented on top of the same iterator, so all three APIs share one merge implementation.
+
+Iterators can also be positioned explicitly with the `StorageIterator` methods:
+
+```rust
+let mut iter = db.range("a".to_string().."z".to_string());
+iter.seek("b"); // first live key >= "b"
+if iter.valid() {
+    println!("{:?} {:?}", iter.key(), iter.value());
+}
+iter.advance(); // next live key
+```
+
+A range iterator snapshots the memtable and clones an `Arc` handle per SSTable when it is created, then releases the read lock. Iteration therefore does not block writers, and the iterator sees the database as it was when `range` was called.
 
 ## Flush Process
 
@@ -133,11 +193,11 @@ Tombstones are safe to remove during full compaction because there are no older 
 
 PebbleDB uses `Arc<RwLock<DbInner>>` for thread-safe access:
 
-- **Reads** (`get`, `keys`, `scan`, `exists`, `stats`) acquire a read lock, allowing concurrent readers.
+- **Reads** (`get`, `keys`, `scan`, `range`, `exists`, `stats`) acquire a read lock, allowing concurrent readers.
 - **Writes** (`set`, `delete`, `flush`, `compact`) acquire a write lock, ensuring exclusive access.
 - **Stats counters** use `AtomicU64` for lock-free tracking during reads.
 
-Multiple threads can safely read from the same PebbleDB instance simultaneously.
+Multiple threads can safely read from the same PebbleDB instance simultaneously. `range` returns an iterator that only holds the read lock while it is being created, so iteration itself never blocks writers.
 
 ## Crash Recovery
 
@@ -204,7 +264,7 @@ cargo build
 cargo test
 ```
 
-45 unit tests covering:
+88 unit tests covering:
 - WAL round-trip, incomplete records, checksum corruption
 - Bloom filter insert, lookup, false positives, encode/decode
 - SSTable v2 block-based format, sparse index, bloom filter, checksum validation
@@ -214,6 +274,10 @@ cargo test
 - Crash recovery: WAL replay after flush, temp file cleanup
 - Concurrent set/get from multiple threads
 - Scan ordering, stats with counters
+- Memtable iterator: key ordering, seeking, tombstones, exhaustion
+- SSTable iterator: multi-block traversal, sparse index seeks, tombstones, empty tables
+- Merge iterator: cross-source ordering, newest-version wins, tombstone suppression
+- Range queries: unbounded and half-open bounds, inclusive and exclusive ends, exact single-key ranges, empty ranges, ranges spanning the memtable and several SSTables
 
 ## Benchmark
 
@@ -230,6 +294,8 @@ Benchmarks three scenarios:
 
 - No transactions, replication, or networking.
 - Fixed database directory (`.pebbledb/` in the current working directory).
-- Sequential scan only; no range queries.
+- Iteration is ascending only; there is no reverse iterator.
+- A range iterator copies the memtable into memory when it is created (bounded by the flush threshold). `SSTable::load` already keeps each SSTable file in memory; the iterator decodes one block at a time instead of materialising every entry.
+- Bloom filters are not used for ordered seeks, because finding the successor of a missing key still requires reading a block.
 - Compaction is a simple full merge; no leveled or tiered strategy.
 - Bloom filter false positive rate ~1% (10 bits/key, 7 hash functions).
