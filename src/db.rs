@@ -1,10 +1,14 @@
-use std::collections::{BTreeMap, HashMap};
+use std::collections::BTreeMap;
 use std::fs;
+use std::ops::{Bound, RangeBounds};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 
 use crate::error::Result;
+use crate::iter::{
+    MemtableIterator, MergeIterator, RangeIterator, SSTableIterator, StorageIterator,
+};
 use crate::sstable::{SSTable, SSTableEntry, write_sstable};
 use crate::wal::{WalReader, WalRecord, WalWriter};
 
@@ -50,9 +54,9 @@ impl Default for AtomicCounters {
 
 struct DbInner {
     path: PathBuf,
-    memtable: HashMap<String, MemtableEntry>,
+    memtable: BTreeMap<String, MemtableEntry>,
     wal: WalWriter,
-    sstables: Vec<SSTable>,
+    sstables: Vec<Arc<SSTable>>,
     next_sst_id: u64,
     flush_threshold: usize,
     counters: AtomicCounters,
@@ -85,12 +89,12 @@ impl PebbleDB {
         let mut next_sst_id = 0u64;
         for (id, sst_path) in &sst_paths {
             let sst = SSTable::load(*id, sst_path)?;
-            sstables.push(sst);
+            sstables.push(Arc::new(sst));
             next_sst_id = (*id).max(next_sst_id) + 1;
         }
 
         let wal_path = path.join("wal.log");
-        let mut memtable = HashMap::new();
+        let mut memtable = BTreeMap::new();
 
         if wal_path.exists() {
             let mut reader = WalReader::open(&wal_path)?;
@@ -181,14 +185,21 @@ impl PebbleDB {
         self.get(key).is_some()
     }
 
-    pub fn keys(&self) -> Vec<String> {
+    /// Iterates over the live keys inside `bounds`, in ascending key order.
+    ///
+    /// Bounds follow `std::ops::RangeBounds`, so `..`, `start..`, `..end`,
+    /// `start..end` and `start..=end` are all supported.
+    pub fn range(&self, bounds: impl RangeBounds<String>) -> RangeIterator {
         let inner = self.inner.read().unwrap();
-        Self::collect_keys_inner(&inner)
+        inner.range_iterator(bounds.start_bound().cloned(), bounds.end_bound().cloned())
+    }
+
+    pub fn keys(&self) -> Vec<String> {
+        self.range(..).map(|(key, _)| key).collect()
     }
 
     pub fn scan(&self) -> Vec<(String, String)> {
-        let inner = self.inner.read().unwrap();
-        Self::collect_scan_inner(&inner)
+        self.range(..).collect()
     }
 
     pub fn compact(&self) -> Result<()> {
@@ -228,60 +239,6 @@ impl PebbleDB {
         None
     }
 
-    fn collect_keys_inner(inner: &DbInner) -> Vec<String> {
-        let mut result: BTreeMap<String, ()> = BTreeMap::new();
-        for sst in &inner.sstables {
-            for (key, entry) in sst.entries() {
-                match entry {
-                    SSTableEntry::Value(_) => {
-                        result.insert(key, ());
-                    }
-                    SSTableEntry::Tombstone => {
-                        result.remove(&key);
-                    }
-                }
-            }
-        }
-        for (key, entry) in &inner.memtable {
-            match entry {
-                MemtableEntry::Value(_) => {
-                    result.insert(key.clone(), ());
-                }
-                MemtableEntry::Tombstone => {
-                    result.remove(key.as_str());
-                }
-            }
-        }
-        result.into_keys().collect()
-    }
-
-    fn collect_scan_inner(inner: &DbInner) -> Vec<(String, String)> {
-        let mut result: BTreeMap<String, String> = BTreeMap::new();
-        for sst in &inner.sstables {
-            for (key, entry) in sst.entries() {
-                match entry {
-                    SSTableEntry::Value(v) => {
-                        result.insert(key, v);
-                    }
-                    SSTableEntry::Tombstone => {
-                        result.remove(&key);
-                    }
-                }
-            }
-        }
-        for (key, entry) in &inner.memtable {
-            match entry {
-                MemtableEntry::Value(v) => {
-                    result.insert(key.clone(), v.clone());
-                }
-                MemtableEntry::Tombstone => {
-                    result.remove(key.as_str());
-                }
-            }
-        }
-        result.into_iter().collect()
-    }
-
     fn compact_inner(inner: &mut DbInner) -> Result<()> {
         if inner.sstables.len() <= 1 {
             return Ok(());
@@ -307,7 +264,7 @@ impl PebbleDB {
         }
 
         let sst = SSTable::load(sst_id, &final_path)?;
-        inner.sstables = vec![sst];
+        inner.sstables = vec![Arc::new(sst)];
         inner
             .counters
             .compactions_completed
@@ -354,6 +311,22 @@ impl PebbleDB {
 }
 
 impl DbInner {
+    /// Builds a merged iterator over the memtable and every SSTable.
+    ///
+    /// Sources are ordered newest first: the memtable holds the most recent writes,
+    /// followed by SSTables in descending ID order. This matches the point-read order.
+    /// The memtable is snapshotted because it is mutated in place; the snapshot is
+    /// bounded by the flush threshold.
+    fn range_iterator(&self, start: Bound<String>, end: Bound<String>) -> RangeIterator {
+        let capacity = self.sstables.len() + 1;
+        let mut children: Vec<Box<dyn StorageIterator>> = Vec::with_capacity(capacity);
+        children.push(Box::new(MemtableIterator::new(&self.memtable)));
+        for sst in self.sstables.iter().rev() {
+            children.push(Box::new(SSTableIterator::new(Arc::clone(sst))));
+        }
+        RangeIterator::new(MergeIterator::new(children), start, end)
+    }
+
     fn flush(&mut self) -> Result<()> {
         if self.memtable.is_empty() {
             return Ok(());
@@ -379,7 +352,7 @@ impl DbInner {
         self.wal.truncate()?;
 
         let sst = SSTable::load(sst_id, &final_path)?;
-        self.sstables.push(sst);
+        self.sstables.push(Arc::new(sst));
         self.memtable.clear();
 
         Ok(())
@@ -406,7 +379,7 @@ fn discover_sstables(path: &Path) -> Result<Vec<(u64, PathBuf)>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tempfile::tempdir;
+    use tempfile::{TempDir, tempdir};
 
     #[test]
     fn test_set_and_get() {
@@ -762,5 +735,349 @@ mod tests {
             let stats_after = db.stats();
             assert!(stats_after.bloom_rejects > rejects_before || stats_after.sst_count > 0);
         }
+    }
+
+    fn db_with(threshold: usize, entries: &[(&str, Option<&str>)]) -> (TempDir, PebbleDB) {
+        let dir = tempdir().unwrap();
+        let db = PebbleDB::open_with_threshold(dir.path().join("db"), threshold).unwrap();
+        for (key, value) in entries {
+            match value {
+                Some(value) => db.set((*key).to_string(), (*value).to_string()).unwrap(),
+                None => {
+                    db.delete(key).unwrap();
+                }
+            }
+        }
+        (dir, db)
+    }
+
+    fn range(db: &PebbleDB, start: Option<&str>, end: Option<&str>) -> Vec<(String, String)> {
+        let bounds = (
+            start.map_or(Bound::Unbounded, |key| Bound::Included(key.to_string())),
+            end.map_or(Bound::Unbounded, |key| Bound::Excluded(key.to_string())),
+        );
+        db.range(bounds).collect()
+    }
+
+    fn owned(entries: &[(&str, &str)]) -> Vec<(String, String)> {
+        entries
+            .iter()
+            .map(|(key, value)| ((*key).to_string(), (*value).to_string()))
+            .collect()
+    }
+
+    #[test]
+    fn test_range_empty_database() {
+        let (_dir, db) = db_with(100, &[]);
+        assert_eq!(range(&db, None, None), Vec::new());
+    }
+
+    #[test]
+    fn test_range_single_key() {
+        let (_dir, db) = db_with(100, &[("only", Some("1"))]);
+        assert_eq!(range(&db, None, None), owned(&[("only", "1")]));
+        assert_eq!(range(&db, Some("only"), None), owned(&[("only", "1")]));
+        assert_eq!(range(&db, None, Some("only")), Vec::new());
+    }
+
+    #[test]
+    fn test_range_multiple_ordered_keys() {
+        let (_dir, db) = db_with(100, &[("a", Some("1")), ("b", Some("2")), ("c", Some("3"))]);
+        assert_eq!(
+            range(&db, None, None),
+            owned(&[("a", "1"), ("b", "2"), ("c", "3")])
+        );
+    }
+
+    #[test]
+    fn test_range_reverse_insertion_order() {
+        let (_dir, db) = db_with(100, &[("c", Some("3")), ("b", Some("2")), ("a", Some("1"))]);
+        assert_eq!(db.keys(), vec!["a", "b", "c"]);
+        assert_eq!(
+            range(&db, None, None),
+            owned(&[("a", "1"), ("b", "2"), ("c", "3")])
+        );
+    }
+
+    #[test]
+    fn test_range_duplicate_updates() {
+        let (_dir, db) = db_with(
+            100,
+            &[("a", Some("old")), ("b", Some("2")), ("a", Some("new"))],
+        );
+        assert_eq!(range(&db, None, None), owned(&[("a", "new"), ("b", "2")]));
+    }
+
+    #[test]
+    fn test_range_excludes_deleted_keys() {
+        let (_dir, db) = db_with(100, &[("a", Some("1")), ("b", Some("2")), ("a", None)]);
+        assert_eq!(range(&db, None, None), owned(&[("b", "2")]));
+    }
+
+    #[test]
+    fn test_range_memtable_only() {
+        let (_dir, db) = db_with(
+            100,
+            &[("k1", Some("v1")), ("k2", Some("v2")), ("k3", Some("v3"))],
+        );
+        assert_eq!(db.stats().sst_count, 0);
+        assert_eq!(
+            range(&db, Some("k2"), None),
+            owned(&[("k2", "v2"), ("k3", "v3")])
+        );
+    }
+
+    #[test]
+    fn test_range_sstable_only() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("db");
+        {
+            let db = PebbleDB::open_with_threshold(&path, 2).unwrap();
+            db.set("a".into(), "1".into()).unwrap();
+            db.set("b".into(), "2".into()).unwrap();
+            db.set("c".into(), "3".into()).unwrap();
+            db.set("d".into(), "4".into()).unwrap();
+            assert_eq!(db.stats().memtable_entries, 0);
+        }
+        let db = PebbleDB::open(&path).unwrap();
+        assert_eq!(db.stats().sst_count, 2);
+        assert_eq!(
+            range(&db, Some("b"), Some("d")),
+            owned(&[("b", "2"), ("c", "3")])
+        );
+    }
+
+    #[test]
+    fn test_range_memtable_and_sstable() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("db");
+        let db = PebbleDB::open_with_threshold(&path, 2).unwrap();
+        db.set("a".into(), "1".into()).unwrap();
+        db.set("b".into(), "2".into()).unwrap();
+        db.set("c".into(), "3".into()).unwrap();
+        assert_eq!(db.stats().sst_count, 1);
+        assert_eq!(db.stats().memtable_entries, 1);
+        assert_eq!(
+            range(&db, None, None),
+            owned(&[("a", "1"), ("b", "2"), ("c", "3")])
+        );
+    }
+
+    #[test]
+    fn test_range_multiple_sstables() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("db");
+        {
+            let db = PebbleDB::open_with_threshold(&path, 2).unwrap();
+            for (key, value) in [("a", "1"), ("b", "2"), ("c", "3"), ("d", "4"), ("e", "5")] {
+                db.set(key.into(), value.into()).unwrap();
+                db.set(format!("pad_{}", key), "x".into()).unwrap();
+            }
+        }
+        let db = PebbleDB::open(&path).unwrap();
+        assert!(db.stats().sst_count >= 3);
+        let scanned = range(&db, Some("c"), Some("e"));
+        assert_eq!(scanned, owned(&[("c", "3"), ("d", "4")]));
+    }
+
+    #[test]
+    fn test_range_overlapping_sstables() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("db");
+        {
+            let db = PebbleDB::open_with_threshold(&path, 2).unwrap();
+            db.set("a".into(), "old".into()).unwrap();
+            db.set("b".into(), "1".into()).unwrap();
+        }
+        {
+            let db = PebbleDB::open_with_threshold(&path, 2).unwrap();
+            db.set("a".into(), "new".into()).unwrap();
+            db.set("c".into(), "2".into()).unwrap();
+            assert_eq!(db.stats().sst_count, 2);
+            assert_eq!(
+                range(&db, None, None),
+                owned(&[("a", "new"), ("b", "1"), ("c", "2")])
+            );
+        }
+    }
+
+    #[test]
+    fn test_range_deleted_key_shadows_older_sstable() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("db");
+        {
+            let db = PebbleDB::open_with_threshold(&path, 2).unwrap();
+            db.set("k".into(), "value".into()).unwrap();
+            db.set("pad".into(), "x".into()).unwrap();
+        }
+        {
+            let db = PebbleDB::open_with_threshold(&path, 2).unwrap();
+            db.delete("k").unwrap();
+            db.set("pad2".into(), "y".into()).unwrap();
+            assert_eq!(db.stats().sst_count, 2);
+            assert_eq!(
+                range(&db, None, None),
+                owned(&[("pad", "x"), ("pad2", "y")])
+            );
+            assert_eq!(
+                range(&db, Some("k"), None),
+                owned(&[("pad", "x"), ("pad2", "y")])
+            );
+        }
+    }
+
+    #[test]
+    fn test_range_skips_tombstone_between_live_keys() {
+        let (_dir, db) = db_with(
+            100,
+            &[
+                ("a", Some("1")),
+                ("b", Some("2")),
+                ("c", Some("3")),
+                ("b", None),
+                ("d", Some("4")),
+            ],
+        );
+        assert_eq!(
+            range(&db, None, None),
+            owned(&[("a", "1"), ("c", "3"), ("d", "4")])
+        );
+    }
+
+    #[test]
+    fn test_range_unbounded_bounds() {
+        let (_dir, db) = db_with(100, &[("a", Some("1")), ("b", Some("2")), ("c", Some("3"))]);
+        assert_eq!(db.range(..).collect::<Vec<_>>().len(), 3);
+        assert_eq!(
+            db.range("b".to_string()..).collect::<Vec<_>>(),
+            owned(&[("b", "2"), ("c", "3")])
+        );
+        assert_eq!(
+            db.range(.."c".to_string()).collect::<Vec<_>>(),
+            owned(&[("a", "1"), ("b", "2")])
+        );
+    }
+
+    #[test]
+    fn test_range_exact_single_key() {
+        let (_dir, db) = db_with(100, &[("a", Some("1")), ("b", Some("2")), ("c", Some("3"))]);
+        assert_eq!(
+            db.range("b".to_string()..="b".to_string())
+                .collect::<Vec<_>>(),
+            owned(&[("b", "2")])
+        );
+        assert_eq!(
+            db.range("b".to_string().."c".to_string())
+                .collect::<Vec<_>>(),
+            owned(&[("b", "2")])
+        );
+    }
+
+    #[test]
+    fn test_range_inclusive_end() {
+        let (_dir, db) = db_with(100, &[("a", Some("1")), ("b", Some("2")), ("c", Some("3"))]);
+        assert_eq!(
+            db.range(..="b".to_string()).collect::<Vec<_>>(),
+            owned(&[("a", "1"), ("b", "2")])
+        );
+    }
+
+    #[test]
+    fn test_range_empty_result() {
+        let (_dir, db) = db_with(100, &[("a", Some("1")), ("b", Some("2")), ("c", Some("3"))]);
+        assert_eq!(range(&db, Some("x"), Some("z")), Vec::new());
+        assert_eq!(range(&db, Some("c"), Some("a")), Vec::new());
+        assert_eq!(range(&db, Some("b"), Some("b")), Vec::new());
+    }
+
+    #[test]
+    fn test_range_seek_to_existing_key() {
+        let (_dir, db) = db_with(100, &[("a", Some("1")), ("b", Some("2")), ("c", Some("3"))]);
+        let mut iter = db.range(..);
+        iter.seek("b");
+        assert_eq!(iter.key(), Some("b"));
+        assert_eq!(iter.value(), Some("2"));
+        assert_eq!(iter.next(), Some(("b".to_string(), "2".to_string())));
+        assert_eq!(iter.next(), Some(("c".to_string(), "3".to_string())));
+        assert_eq!(iter.next(), None);
+    }
+
+    #[test]
+    fn test_range_seek_between_keys() {
+        let (_dir, db) = db_with(100, &[("a", Some("1")), ("c", Some("3")), ("e", Some("5"))]);
+        let mut iter = db.range(..);
+        iter.seek("b");
+        assert_eq!(iter.key(), Some("c"));
+        iter.seek("d");
+        assert_eq!((iter.key(), iter.value()), (Some("e"), Some("5")));
+    }
+
+    #[test]
+    fn test_range_seek_beyond_final_key() {
+        let (_dir, db) = db_with(100, &[("a", Some("1")), ("b", Some("2"))]);
+        let mut iter = db.range(..);
+        iter.seek("z");
+        assert!(!iter.valid());
+        assert_eq!(iter.key(), None);
+        assert_eq!(iter.next(), None);
+    }
+
+    #[test]
+    fn test_range_seek_respects_end_bound() {
+        let (_dir, db) = db_with(100, &[("a", Some("1")), ("b", Some("2")), ("c", Some("3"))]);
+        let mut iter = db.range(.."c".to_string());
+        iter.seek("c");
+        assert!(!iter.valid());
+        iter.seek("b");
+        assert_eq!(iter.key(), Some("b"));
+    }
+
+    #[test]
+    fn test_scan_and_keys_match_range() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("db");
+        {
+            let db = PebbleDB::open_with_threshold(&path, 2).unwrap();
+            db.set("a".into(), "1".into()).unwrap();
+            db.set("b".into(), "2".into()).unwrap();
+            db.set("c".into(), "3".into()).unwrap();
+            db.set("d".into(), "4".into()).unwrap();
+        }
+        let db = PebbleDB::open_with_threshold(&path, 100).unwrap();
+        db.set("e".into(), "5".into()).unwrap();
+        db.delete("b").unwrap();
+        assert_eq!(db.stats().sst_count, 2);
+        assert_eq!(db.stats().memtable_entries, 2);
+
+        let expected = owned(&[("a", "1"), ("c", "3"), ("d", "4"), ("e", "5")]);
+        assert_eq!(db.scan(), expected);
+        assert_eq!(db.range(..).collect::<Vec<_>>(), expected);
+        assert_eq!(db.keys(), vec!["a", "c", "d", "e"]);
+        assert_eq!(
+            range(&db, Some("b"), Some("e")),
+            owned(&[("c", "3"), ("d", "4")])
+        );
+        assert_eq!(db.get("b"), None);
+    }
+
+    #[test]
+    fn test_range_after_reopen() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("db");
+        {
+            let db = PebbleDB::open_with_threshold(&path, 100).unwrap();
+            db.set("b".into(), "2".into()).unwrap();
+            db.set("a".into(), "1".into()).unwrap();
+            db.set("c".into(), "3".into()).unwrap();
+        }
+        let db = PebbleDB::open(&path).unwrap();
+        assert_eq!(
+            range(&db, None, None),
+            owned(&[("a", "1"), ("b", "2"), ("c", "3")])
+        );
+        assert_eq!(
+            range(&db, Some("b"), None),
+            owned(&[("b", "2"), ("c", "3")])
+        );
     }
 }
