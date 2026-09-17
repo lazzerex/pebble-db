@@ -7,6 +7,8 @@ pub enum PebbleError {
     WalCorruption(String),
     WalIncomplete,
     SSTableCorruption(String),
+    InjectedFault(String),
+    CacheCorruption(String),
 }
 
 impl fmt::Display for PebbleError {
@@ -16,6 +18,8 @@ impl fmt::Display for PebbleError {
             PebbleError::WalCorruption(msg) => write!(f, "WAL corruption: {}", msg),
             PebbleError::WalIncomplete => write!(f, "incomplete WAL record"),
             PebbleError::SSTableCorruption(msg) => write!(f, "SSTable corruption: {}", msg),
+            PebbleError::InjectedFault(msg) => write!(f, "injected fault: {}", msg),
+            PebbleError::CacheCorruption(msg) => write!(f, "cache corruption: {}", msg),
         }
     }
 }
