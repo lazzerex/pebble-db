@@ -1,5 +1,6 @@
 use std::collections::BTreeMap;
 use std::fs;
+use std::fs::OpenOptions;
 use std::ops::{Bound, RangeBounds};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -7,6 +8,7 @@ use std::sync::{Arc, RwLock};
 
 use crate::compaction::{CompactionPlan, FileMeta, LevelConfig, pick_compaction};
 use crate::error::Result;
+use crate::fault::{Fault, FaultInjector, FaultPoint};
 use crate::iter::{
     MemtableIterator, MergeIterator, RangeIterator, SSTableIterator, StorageIterator,
 };
@@ -18,6 +20,7 @@ const DEFAULT_L0_COMPACTION_THRESHOLD: usize = 4;
 const DEFAULT_LEVEL_SIZE_MULTIPLIER: usize = 10;
 const DEFAULT_TARGET_LEVEL_SIZE: usize = 8 * 1024 * 1024;
 const DEFAULT_TARGET_FILE_SIZE: usize = 2 * 1024 * 1024;
+const MERGE_PENDING_FILE: &str = "merge.pending";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DbOptions {
@@ -26,6 +29,7 @@ pub struct DbOptions {
     pub level_size_multiplier: usize,
     pub target_level_size: usize,
     pub target_file_size: usize,
+    pub fault: Option<Fault>,
 }
 
 impl Default for DbOptions {
@@ -36,6 +40,7 @@ impl Default for DbOptions {
             level_size_multiplier: DEFAULT_LEVEL_SIZE_MULTIPLIER,
             target_level_size: DEFAULT_TARGET_LEVEL_SIZE,
             target_file_size: DEFAULT_TARGET_FILE_SIZE,
+            fault: None,
         }
     }
 }
@@ -158,6 +163,7 @@ struct DbInner {
     options: DbOptions,
     counters: AtomicCounters,
     metrics: Metrics,
+    fault: FaultInjector,
 }
 
 #[derive(Clone)]
@@ -182,6 +188,7 @@ impl PebbleDB {
 
     pub fn open_with_options(path: impl AsRef<Path>, options: DbOptions) -> Result<Self> {
         let path = path.as_ref().to_path_buf();
+        let fault = options.fault;
         fs::create_dir_all(&path)?;
 
         for entry in fs::read_dir(&path)? {
@@ -191,6 +198,8 @@ impl PebbleDB {
                 fs::remove_file(entry.path())?;
             }
         }
+
+        finish_pending_merge(&path)?;
 
         let mut levels: Vec<Vec<Arc<SSTable>>> = vec![Vec::new()];
         let mut next_sst_id = 0u64;
@@ -209,8 +218,8 @@ impl PebbleDB {
 
         if wal_path.exists() {
             let mut reader = WalReader::open(&wal_path)?;
-            let records = reader.read_all()?;
-            for record in records {
+            let recovery = reader.recover()?;
+            for record in recovery.records {
                 match record {
                     WalRecord::Set { key, value } => {
                         memtable.insert(key, MemtableEntry::Value(value));
@@ -219,6 +228,10 @@ impl PebbleDB {
                         memtable.insert(key, MemtableEntry::Tombstone);
                     }
                 }
+            }
+            let wal_len = fs::metadata(&wal_path)?.len();
+            if recovery.valid_len < wal_len {
+                truncate_wal(&wal_path, recovery.valid_len)?;
             }
         }
 
@@ -233,6 +246,7 @@ impl PebbleDB {
             options,
             counters: AtomicCounters::default(),
             metrics: Metrics::default(),
+            fault: FaultInjector::new(fault),
         };
 
         Ok(Self {
@@ -242,11 +256,16 @@ impl PebbleDB {
 
     pub fn set(&self, key: String, value: String) -> Result<()> {
         let mut inner = self.inner.write().unwrap();
-        inner.wal.write_record(&WalRecord::Set {
+        inner.fault.hit(FaultPoint::BeforeWalAppend)?;
+        inner.wal.append_record(&WalRecord::Set {
             key: key.clone(),
             value: value.clone(),
         })?;
+        inner.fault.hit(FaultPoint::AfterWalAppend)?;
+        inner.wal.sync()?;
+        inner.fault.hit(FaultPoint::AfterWalFsync)?;
         inner.memtable.insert(key, MemtableEntry::Value(value));
+        inner.fault.hit(FaultPoint::AfterMemtableUpdate)?;
         if inner.memtable.len() >= inner.options.flush_threshold {
             inner.flush()?;
         }
@@ -283,12 +302,17 @@ impl PebbleDB {
     pub fn delete(&self, key: &str) -> Result<bool> {
         let mut inner = self.inner.write().unwrap();
         let existed = Self::get_inner(&inner, key).is_some();
-        inner.wal.write_record(&WalRecord::Delete {
+        inner.fault.hit(FaultPoint::BeforeWalAppend)?;
+        inner.wal.append_record(&WalRecord::Delete {
             key: key.to_string(),
         })?;
+        inner.fault.hit(FaultPoint::AfterWalAppend)?;
+        inner.wal.sync()?;
+        inner.fault.hit(FaultPoint::AfterWalFsync)?;
         inner
             .memtable
             .insert(key.to_string(), MemtableEntry::Tombstone);
+        inner.fault.hit(FaultPoint::AfterMemtableUpdate)?;
         if inner.memtable.len() >= inner.options.flush_threshold {
             inner.flush()?;
         }
@@ -478,8 +502,12 @@ impl DbInner {
         let tmp_path = self.path.join(format!("{}.tmp", file_name));
         let final_path = self.path.join(file_name);
 
+        self.fault.hit(FaultPoint::BeforeSstableCreation)?;
         write_sstable(&tmp_path, entries)?;
+        self.fault.hit(FaultPoint::AfterSstableWrite)?;
+        self.fault.hit(FaultPoint::BeforeAtomicRename)?;
         fs::rename(&tmp_path, &final_path)?;
+        self.fault.hit(FaultPoint::AfterAtomicRename)?;
 
         Ok(Arc::new(SSTable::load(id, &final_path)?))
     }
@@ -499,11 +527,15 @@ impl DbInner {
         }
 
         let sst = self.write_level_file(0, &entries)?;
+        self.fault.hit(FaultPoint::BeforeWalTruncation)?;
         self.wal.truncate()?;
+        self.fault.hit(FaultPoint::AfterWalTruncation)?;
 
         self.metrics.bytes_flushed += sst.file_size() as u64;
+        self.fault.hit(FaultPoint::BeforeMetadataUpdate)?;
         self.levels[0].push(sst);
         self.memtable.clear();
+        self.fault.hit(FaultPoint::AfterMetadataUpdate)?;
 
         self.compact_pending()?;
         Ok(())
@@ -620,10 +652,15 @@ impl DbInner {
             outputs.push(sst);
         }
 
+        self.fault.hit(FaultPoint::AfterCompactionOutputCreation)?;
+        write_pending_merge(&self.path, &outputs, &job.inputs)?;
         for (_, sst) in &job.inputs {
+            self.fault.hit(FaultPoint::BeforeObsoleteFileDelete)?;
             let _ = fs::remove_file(sst.path());
         }
+        self.fault.hit(FaultPoint::AfterObsoleteFileDelete)?;
 
+        self.fault.hit(FaultPoint::BeforeMetadataUpdate)?;
         for files in &mut self.levels {
             files.retain(|sst| !job.inputs.iter().any(|(_, input)| input.id == sst.id));
         }
@@ -632,6 +669,8 @@ impl DbInner {
         let target = &mut self.levels[job.output_level as usize];
         target.extend(outputs);
         target.sort_by_key(|sst| sst.id);
+        self.fault.hit(FaultPoint::AfterMetadataUpdate)?;
+        clear_pending_merge(&self.path)?;
 
         Ok(JobOutcome {
             bytes_read,
@@ -676,6 +715,99 @@ fn discover_sstables(path: &Path) -> Result<Vec<(u64, u32, PathBuf)>> {
     }
     sstables.sort_by_key(|(id, _, _)| *id);
     Ok(sstables)
+}
+
+fn truncate_wal(path: &Path, len: u64) -> Result<()> {
+    let file = OpenOptions::new().write(true).open(path)?;
+    file.set_len(len)?;
+    file.sync_all()?;
+    Ok(())
+}
+
+fn pending_merge_path(path: &Path) -> PathBuf {
+    path.join(MERGE_PENDING_FILE)
+}
+
+fn write_pending_merge(
+    path: &Path,
+    outputs: &[Arc<SSTable>],
+    inputs: &[(u32, Arc<SSTable>)],
+) -> Result<()> {
+    let mut content = String::from("outputs: ");
+    content.push_str(&join_ids(outputs.iter().map(|sst| sst.id)));
+    content.push_str("\ninputs: ");
+    content.push_str(&join_ids(inputs.iter().map(|(_, sst)| sst.id)));
+    content.push('\n');
+
+    let tmp = path.join(format!("{}.tmp", MERGE_PENDING_FILE));
+    fs::write(&tmp, content)?;
+    fs::rename(&tmp, pending_merge_path(path))?;
+    Ok(())
+}
+
+fn clear_pending_merge(path: &Path) -> Result<()> {
+    let marker = pending_merge_path(path);
+    if marker.exists() {
+        fs::remove_file(marker)?;
+    }
+    Ok(())
+}
+
+fn read_pending_merge(path: &Path) -> Result<Option<(Vec<u64>, Vec<u64>)>> {
+    let marker = pending_merge_path(path);
+    if !marker.exists() {
+        return Ok(None);
+    }
+    let content = fs::read_to_string(&marker)?;
+    let mut outputs = Vec::new();
+    let mut inputs = Vec::new();
+    for line in content.lines() {
+        if let Some(rest) = line.strip_prefix("outputs:") {
+            outputs = parse_ids(rest);
+        } else if let Some(rest) = line.strip_prefix("inputs:") {
+            inputs = parse_ids(rest);
+        }
+    }
+    Ok(Some((outputs, inputs)))
+}
+
+fn join_ids(ids: impl Iterator<Item = u64>) -> String {
+    ids.map(|id| id.to_string()).collect::<Vec<_>>().join(",")
+}
+
+fn parse_ids(text: &str) -> Vec<u64> {
+    text.split(',')
+        .filter_map(|id| id.trim().parse().ok())
+        .collect()
+}
+
+fn finish_pending_merge(path: &Path) -> Result<()> {
+    let Some((outputs, inputs)) = read_pending_merge(path)? else {
+        return Ok(());
+    };
+
+    let mut files = Vec::new();
+    for entry in fs::read_dir(path)? {
+        let entry = entry?;
+        let name = entry.file_name().to_string_lossy().to_string();
+        if let Some((id, _)) = parse_sstable_file_name(&name) {
+            files.push((id, entry.path()));
+        }
+    }
+
+    let outputs_present = outputs
+        .iter()
+        .all(|id| files.iter().any(|(file_id, _)| file_id == id));
+    if outputs_present {
+        for (id, file) in &files {
+            if inputs.contains(id) {
+                fs::remove_file(file)?;
+            }
+        }
+    }
+
+    fs::remove_file(pending_merge_path(path))?;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -980,6 +1112,94 @@ mod tests {
             assert_eq!(db.get("b"), Some("2".into()));
             assert!(!temp_file.exists());
         }
+    }
+
+    #[test]
+    fn test_compaction_crash_before_input_cleanup_does_not_resurrect_deleted_keys() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("db");
+
+        {
+            let db = PebbleDB::open_with_options(&path, options(2, 2, usize::MAX)).unwrap();
+            db.set("k".into(), "v1".into()).unwrap();
+            db.set("a".into(), "1".into()).unwrap();
+            db.set("b".into(), "2".into()).unwrap();
+            db.set("c".into(), "3".into()).unwrap();
+            assert_eq!(levels_of(&db), vec![(1, 1)]);
+            assert_eq!(db.get("k"), Some("v1".into()));
+        }
+
+        {
+            let fault = Fault::new(FaultPoint::BeforeObsoleteFileDelete, 3);
+            let db = PebbleDB::open_with_options(&path, fault_options(2, 2, fault)).unwrap();
+            db.delete("k").unwrap();
+            db.set("d".into(), "4".into()).unwrap();
+            db.set("e".into(), "5".into()).unwrap();
+            assert!(db.set("f".into(), "6".into()).is_err());
+            assert!(path.join(MERGE_PENDING_FILE).exists());
+        }
+
+        let db = PebbleDB::open_with_options(&path, options(2, 2, usize::MAX)).unwrap();
+        assert!(!path.join(MERGE_PENDING_FILE).exists());
+        assert_eq!(db.get("k"), None);
+        assert_eq!(
+            db.scan(),
+            owned(&[
+                ("a", "1"),
+                ("b", "2"),
+                ("c", "3"),
+                ("d", "4"),
+                ("e", "5"),
+                ("f", "6")
+            ])
+        );
+    }
+
+    #[test]
+    fn test_interrupted_merge_is_replayed_on_open() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("db");
+
+        {
+            let db = PebbleDB::open_with_options(&path, no_compaction(2)).unwrap();
+            db.set("a".into(), "1".into()).unwrap();
+            db.set("b".into(), "2".into()).unwrap();
+            assert_eq!(levels_of(&db), vec![(0, 1)]);
+        }
+
+        let survivor = path.join(sstable_file_name(1, 9));
+        {
+            let mut merged: BTreeMap<String, SSTableEntry> = BTreeMap::new();
+            let sst = SSTable::load(0, &path.join(sstable_file_name(0, 0))).unwrap();
+            merged.extend(sst.entries());
+            write_sstable(&survivor, &merged).unwrap();
+        }
+        fs::write(path.join(MERGE_PENDING_FILE), "outputs: 9\ninputs: 0\n").unwrap();
+
+        let db = PebbleDB::open_with_options(&path, no_compaction(2)).unwrap();
+        assert_eq!(levels_of(&db), vec![(1, 1)]);
+        assert_eq!(file_names(&path), vec!["sstable_L1_000009.sst"]);
+        assert_eq!(db.scan(), owned(&[("a", "1"), ("b", "2")]));
+        assert!(!path.join(MERGE_PENDING_FILE).exists());
+    }
+
+    #[test]
+    fn test_interrupted_merge_keeps_inputs_when_outputs_are_missing() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("db");
+
+        {
+            let db = PebbleDB::open_with_options(&path, no_compaction(2)).unwrap();
+            db.set("a".into(), "1".into()).unwrap();
+            db.set("b".into(), "2".into()).unwrap();
+        }
+
+        fs::write(path.join(MERGE_PENDING_FILE), "outputs: 9\ninputs: 0\n").unwrap();
+
+        let db = PebbleDB::open_with_options(&path, no_compaction(2)).unwrap();
+        assert_eq!(levels_of(&db), vec![(0, 1)]);
+        assert_eq!(db.scan(), owned(&[("a", "1"), ("b", "2")]));
+        assert!(!path.join(MERGE_PENDING_FILE).exists());
     }
 
     #[test]
@@ -1399,6 +1619,7 @@ mod tests {
             level_size_multiplier: 10,
             target_level_size: usize::MAX,
             target_file_size: 2 * 1024 * 1024,
+            fault: None,
         }
     }
 
@@ -1413,6 +1634,22 @@ mod tests {
             level_size_multiplier: 2,
             target_level_size,
             target_file_size: 2 * 1024 * 1024,
+            fault: None,
+        }
+    }
+
+    fn fault_options(
+        flush_threshold: usize,
+        l0_compaction_threshold: usize,
+        fault: crate::fault::Fault,
+    ) -> DbOptions {
+        DbOptions {
+            flush_threshold,
+            l0_compaction_threshold,
+            level_size_multiplier: 2,
+            target_level_size: usize::MAX,
+            target_file_size: 2 * 1024 * 1024,
+            fault: Some(fault),
         }
     }
 
