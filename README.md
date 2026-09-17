@@ -38,6 +38,8 @@ PebbleDB exists to demonstrate how a storage engine works internally. It impleme
 - **Leveled Compaction** keeps files within each level sorted and non-overlapping. When L0 exceeds the compaction threshold its files are merged with overlapping L1 files into new L1 files. If the resulting L1 exceeds its size budget the oldest oversized file cascades into L2, and so on. Tombstones are dropped when they reach the deepest level that still holds the key.
 - **Bloom Filter** per SSTable rejects lookups for keys that definitely don't exist, avoiding unnecessary disk reads.
 - **Iterators** provide ordered, lazy access to a single source (memtable or SSTable) and a merge iterator combines them into one ascending view for range queries.
+- **Fault Injection** (`src/fault.rs`) can deterministically fail or abort a database at any persistence boundary for crash-recovery tests. It is disabled by default and costs one `Option` check per boundary.
+- **PebbleCache** (`src/cache.rs`) is a small TTL cache built on top of PebbleDB, demonstrating use of the engine as persistent cache storage.
 
 ## Write Path
 
@@ -205,19 +207,51 @@ Multiple threads can safely read from the same PebbleDB instance simultaneously.
 
 On startup:
 
-1. Clean up orphaned temp files (`.sst.tmp`).
-2. Discover and load all SSTables by filename, sorted by ID.
-3. Parse block indexes and bloom filters.
-4. Replay the WAL into the memtable.
+1. Remove orphaned temp files (`.tmp`) left behind by an interrupted flush or compaction.
+2. Replay an interrupted compaction from `merge.pending`.
+3. Discover and load all SSTables by filename, sorted by ID.
+4. Parse block indexes and bloom filters.
+5. Replay the WAL into the memtable, discarding a torn tail.
 
 The database is consistent after replay because:
+
 - SSTables contain previously flushed data.
 - The WAL contains any operations that were not yet flushed.
 - Duplicate entries (in both SSTable and WAL) are harmless; the memtable takes precedence on reads.
 
-## Durability
+## Durability Contract
 
-Each `set` and `delete` call writes to the WAL and calls `fsync` before returning success. SSTables are written to a temp file and atomically renamed with fsync.
+PebbleDB makes exactly one durability promise, and the crash tests verify it:
+
+```text
+If set() or delete() returns Ok:
+    the operation is in the WAL, fsynced, and survives a process crash
+```
+
+More precisely:
+
+- `set` and `delete` append a length-prefixed, CRC32-protected record to `wal.log` and `fsync` it before returning `Ok`.
+- Acknowledged operations that were not yet flushed are replayed from the WAL on the next open.
+- An operation that returns an error (I/O failure or an injected fault) may or may not be present after recovery. Only `Ok` is a promise.
+- Flushes and compactions rename a complete `.sst.tmp` file into place before the WAL is truncated, so an SSTable that exists on disk is never partially written.
+- SSTable files are not `fsync`ed and the database directory is not `fsync`ed after a rename. The contract therefore covers process termination (panic, `abort`, `SIGKILL`), not sudden power loss.
+
+## WAL Recovery Policy
+
+Records are parsed one at a time and each case has an explicit policy:
+
+```text
+truncated length prefix                -> torn tail, discarded
+record whose declared size passes EOF  -> torn tail, discarded
+payload shorter than declared size     -> torn tail, discarded
+declared size shorter than a header    -> garbage tail, discarded
+CRC mismatch on a complete record      -> corruption, open fails
+complete final record with bad CRC     -> corruption, open fails
+```
+
+Discarding a torn tail is safe because a record only becomes durable after `fsync`, so a partially written record was never acknowledged. Damage that cannot be explained by an interrupted append is reported as `PebbleError::WalCorruption` instead of being skipped silently.
+
+After a torn tail is discarded the WAL is truncated to the end of the last complete record, so subsequent appends stay parseable. Recovery is repeatable: opening the same directory again neither changes the logical contents nor re-triggers the discard.
 
 ## Compaction Strategy
 
@@ -237,9 +271,94 @@ PebbleDB uses leveled compaction to bound read amplification and reclaim space:
 
 **Tombstone handling**: tombstones are kept while a deeper level holds data that they might shadow. When all overlapping files live in the deepest level containing that key, the tombstone is dropped and the dead data is reclaimed.
 
-**Crash safety** follows the same atomic-rename protocol used by flushes: compaction output is written to a `.sst.tmp` file, fsynced, then renamed into place. Input files are deleted only after all outputs are durable. On startup orphaned `.sst.tmp` files are removed, and any leftover input/output duplicates are resolved by the next compaction cycle.
+**Crash safety**: compaction output is written to a `.sst.tmp` file and renamed into place before any input is touched. Before the first input is deleted, the ids of the outputs and inputs are recorded in a small `merge.pending` file (written through a temp file and renamed as well). Inputs are then deleted one at a time, and `merge.pending` is removed only after the in-memory metadata has been updated.
+
+If a crash happens anywhere in that sequence, `open` replays the pending merge: when every output listed in `merge.pending` exists on disk, the listed inputs are removed again (a no-op for the ones already gone) and the marker is deleted. When an output is missing, the inputs are kept, because duplicates are harmless — reads prefer the newest file within a level — and the next compaction merges them again.
+
+Replaying the marker is a correctness fix, not just cleanup. A compaction that drops tombstones rewrites the surviving data into the output, so a crash after the tombstone's input file was deleted but before an older input file was deleted would let a deleted value reappear. Finishing the pending merge makes the whole input set disappear together. `db::tests::test_compaction_crash_before_input_cleanup_does_not_resurrect_deleted_keys` pins this window down.
 
 `compact()` runs the leveled compaction loop until no level needs work. `compact_full()` is a legacy baseline that merges every SSTable into a single file at level 1.
+
+## Fault Injection
+
+Persistence boundaries can be failed or aborted deterministically through a small test-oriented abstraction (`src/fault.rs`):
+
+```text
+before_wal_append              after_wal_append              after_wal_fsync
+after_memtable_update          before_sstable_creation       after_sstable_write
+before_atomic_rename           after_atomic_rename           before_metadata_update
+after_metadata_update          before_obsolete_file_delete   after_obsolete_file_delete
+before_wal_truncation          after_wal_truncation          after_compaction_output_creation
+```
+
+A fault is a triple:
+
+- `point` — the boundary to trip.
+- `hit` — the Nth time that boundary is reached. Hits are counted per database instance, so a fixed seed and workload always trip at the same place.
+- `mode` — `Error` returns `PebbleError::InjectedFault` (fast, in-process), `Abort` calls `std::process::abort()` (a real process termination).
+
+Every database instance owns its own `FaultInjector`, so faulted tests cannot disturb each other and can run in parallel. `DbOptions::fault` defaults to `None`, and each injection point then costs a single `Option` check, so ordinary builds pay nothing.
+
+The library itself never reads test configuration from the environment. `src/bin/crash_child.rs` is a separate harness binary that reads its settings from environment variables and passes them into `DbOptions`.
+
+## Persistent Cache (PebbleCache)
+
+`src/cache.rs` builds a small cache on top of PebbleDB. It shows what an embedded key-value store is good at: the cache is just an application on top of the storage engine, and PebbleDB remains the only thing that touches the disk.
+
+```text
+Application
+    |
+    v
+PebbleCache          <- TTL, lazy expiration, statistics, prefix
+    |
+    v
+PebbleDB
+    |
+    +-- WAL
+    +-- Memtable
+    +-- SSTables
+```
+
+Why a persistent cache at all: an ordinary in-memory cache disappears on restart, so every process restart pays the expensive lookups again. Keeping the cache in PebbleDB means entries survive restarts, compaction reclaims space from expired entries, and no second persistence mechanism (no dump file, no separate format) has to be maintained.
+
+API:
+
+```rust
+use std::time::Duration;
+use pebbledb::cache::PebbleCache;
+
+let cache = PebbleCache::open(".pebblecache").unwrap();
+
+match cache.get("what-is-stow").unwrap() {
+    Some(value) => println!("hit: {}", value),
+    None => {
+        let value = expensive_lookup();
+        cache.set("what-is-stow", &value, Duration::from_secs(60 * 60 * 24)).unwrap();
+    }
+}
+
+cache.delete("what-is-stow").unwrap();
+cache.clear().unwrap();
+let stats = cache.stats();
+```
+
+How it works:
+
+- **Entry encoding** — a cache entry is stored as `"<expires_at_ms>:<value>"`. `0` means "never expires", anything else is a Unix timestamp in milliseconds. Values may contain colons; only the first colon is a separator.
+- **TTL** — `set(key, value, ttl)` computes `now + ttl`; `Duration::ZERO` stores `0` and never expires.
+- **Expiration** — lazily, on `get` (and therefore on `exists`). An expired entry is treated as a miss, deleted from PebbleDB, and counted in `CacheStats::expired`. There is no background scanner and no timer thread: reading the entry is the only moment a miss can matter, and deletion-on-read keeps the design explicit.
+- **Hits and misses** — a `get` that finds a live entry increments `hits`; an absent or expired entry increments `misses`. `sets`, `deletes`, `expired` and `clears` are counted too.
+- **Namespace** — every cache entry is stored under the key prefix `cache:`, so cache data can never collide with ordinary PebbleDB keys that the application writes itself. `clear()` walks the prefix and stops at the first key that does not carry it, which is why `cachez:...` is left alone.
+- **Concurrency** — the underlying `PebbleDB` is already thread-safe (`Arc<RwLock<DbInner>>`), so the cache only protects its own counters with a `Mutex<CacheStats>`. `PebbleCache` is `Send + Sync` and can be shared with `Arc`. This is intentionally the simplest mechanism that works, not an optimized concurrent cache.
+- **Limitations, on purpose** — no size or entry limit and no eviction policy (an LRU would need access-order state that PebbleDB does not keep, plus either a background thread or write amplification on reads), no background expiration, no TTL refresh on read, no metrics export, no Redis compatibility, no network protocol.
+
+Run the demonstration:
+
+```text
+cargo run --example cache_demo
+```
+
+It performs a request that misses, computes and stores the value, repeats the request as a hit, expires an entry with a short TTL, reopens the database to show persistence, and prints the statistics.
 
 ## Commands
 
@@ -294,21 +413,53 @@ cargo build
 cargo test
 ```
 
-114 unit tests covering:
-- WAL round-trip, incomplete records, checksum corruption
-- Bloom filter insert, lookup, false positives, encode/decode
-- SSTable v2 block-based format, sparse index, bloom filter, checksum validation
-- Memtable flushing and SSTable creation
-- Read path: memtable override, SSTable lookup, bloom rejection, tombstone behavior
-- Compaction policy: level size budgets, L0 threshold, cascade cascading, tombstone handling, file splitting, non-overlap invariants, overlap tolerance, deterministic picker
-- Leveled compaction DB tests: flush to L0, threshold trigger, L0/L1 overlap, L1 non-overlap, multi-level cascade, tombstone retention/removal, recovery, legacy filenames, partial-compaction crash duplicates, temp-file cleanup, metrics, full-compaction baseline, concurrent reads
-- Crash recovery: WAL replay after flush, temp file cleanup
-- Concurrent set/get from multiple threads
-- Scan ordering, stats with counters
-- Memtable iterator: key ordering, seeking, tombstones, exhaustion
-- SSTable iterator: multi-block traversal, sparse index seeks, tombstones, empty tables
-- Merge iterator: cross-source ordering, newest-version wins, tombstone suppression
-- Range queries: unbounded and half-open bounds, inclusive and exclusive ends, exact single-key ranges, empty ranges, ranges spanning the memtable and several SSTables
+The suite is split into unit tests (`#[cfg(test)]` modules next to the code) and integration tests:
+
+```text
+tests/crash_recovery.rs    fault-injection sweep, reference model, subprocess crashes
+tests/wal_corruption.rs    torn, truncated and corrupted WAL tails
+tests/crash_stress.rs      crash stress mode (ignored by default)
+src/bin/crash_child.rs     harness binary that dies mid-operation for the tests above
+```
+
+What is covered:
+
+- **WAL** — round-trip, incomplete records, checksum corruption, torn tail discarded, garbage tail discarded, corrupted durable record rejected, recovery truncates the torn tail
+- **Bloom filter** — insert, lookup, false positives, encode/decode
+- **SSTable v2** — block-based format, sparse index, bloom filter, checksum validation
+- **Flush and reads** — memtable flushing, SSTable creation, memtable override, tombstone behavior, bloom rejection, path counters
+- **Compaction** — level budgets, L0 threshold, cascade, tombstone retention/removal, file splitting, non-overlap invariants, overlap tolerance, deterministic picker, full-compaction baseline
+- **Compaction crash safety** — `merge.pending` replay, cleanup when outputs are missing, no resurrection of deleted keys after a crash during input deletion, legacy filenames, duplicate tolerance
+- **Fault injection** — every fault point fires; all acknowledged operations survive a crash at every point and hit index; in-process errors and real subprocess aborts; identical reproduction of a crash run
+- **Properties** — recovery, delete (no resurrection), range/scan equality with a `BTreeMap` reference model, idempotent repeated recovery, deterministic randomized workloads across flush/compaction/reopen
+- **Iterators and ranges** — memtable, SSTable and merge iterators, seeks, tombstones, unbounded/inclusive/exclusive bounds
+- **Cache** — set/get/miss, overwrite, values with colons, delete, exists, TTL expiration, non-expiring entries, lazy deletion of expired entries, statistics, clear (without touching other keys), prefix namespace, persistence across reopen, survival across flush, concurrent access
+
+## Crash-Recovery Testing
+
+```text
+cargo test --test crash_recovery                 # fast in-process sweep + real process crashes
+cargo test --test wal_corruption                 # WAL tail damage
+cargo test --test crash_stress -- --ignored --nocapture
+```
+
+How the tests are built:
+
+- **Reference model** — the test keeps its own `BTreeMap` of the operations it issued. Nothing from PebbleDB is used to compute expected results.
+- **In-process sweep** — for every fault point and the first three hits, a deterministic randomized workload runs against a fresh database until the injected fault stops it. The handle is dropped, the database is reopened, and the result is compared with the reference model: acknowledged operations intact, deleted keys absent, `scan()` equal to the model.
+- **Subprocess crashes** — `src/bin/crash_child.rs` runs a fixed workload, prints `TRY` before each operation, `ACK` after it, then dies inside the storage engine. The parent process turns that output into the reference model, reopens the database and verifies it. The same seed, fault point and hit index reproduce the same crash exactly (`crash_child_reproduces_the_same_run_twice`).
+- **Unacknowledged operations** — the operation that was in flight when the process died may be present or absent afterwards; the contract only requires acknowledged operations to survive, so both outcomes are accepted for that one key and everything else must match.
+- **Stress mode** (`--ignored`) — throws many crashes across all fault points and prints a summary:
+
+```text
+seed:               12345
+operations:         120
+crashes:            30
+recovery failures:  0
+data mismatches:    0
+```
+
+Longer runs are configured with `PEBBLEDB_STRESS_SEED`, `PEBBLEDB_STRESS_OPS`, `PEBBLEDB_STRESS_CRASHES` and `PEBBLEDB_STRESS_MODE` (`abort` or `error`). Failures print the seed, the fault point, the hit index and how many operations had been acknowledged, so they can be replayed.
 
 ## Benchmark
 
@@ -330,3 +481,12 @@ Benchmarks three scenarios:
 - Bloom filters are not used for ordered seeks, because finding the successor of a missing key still requires reading a block.
 - Compaction runs synchronously on the flush path (no background thread).
 - Bloom filter false positive rate ~1% (10 bits/key, 7 hash functions).
+
+### Known durability risks
+
+- Durability is proven against process termination, not against power loss: neither SSTable files nor the database directory are `fsync`ed, so a rename can be lost by a kernel or disk failure.
+- WAL corruption that is not a torn tail (a flipped byte in a durable record) makes the database fail to open; there is no repair or salvage tool.
+- The WAL is a single file that is only truncated on flush, so a database configured with a very large flush threshold grows the WAL without bound.
+- All writes share one `RwLock`, so flush and compaction block readers and writers while they run.
+- `PebbleCache` has no eviction: a cache written faster than it is read grows until the caller deletes entries or calls `clear()`.
+- Fault injection is a test facility: an injected fault leaves the live handle partially updated. Recovery is guaranteed by reopening the database, which is exactly what the tests do.
