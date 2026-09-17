@@ -138,12 +138,21 @@ impl WalWriter {
         })
     }
 
-    pub fn write_record(&mut self, record: &WalRecord) -> Result<()> {
+    pub fn append_record(&mut self, record: &WalRecord) -> Result<()> {
         let encoded = record.encode();
         self.writer.write_all(&encoded)?;
         self.writer.flush()?;
+        Ok(())
+    }
+
+    pub fn sync(&mut self) -> Result<()> {
         self.writer.get_ref().sync_all()?;
         Ok(())
+    }
+
+    pub fn write_record(&mut self, record: &WalRecord) -> Result<()> {
+        self.append_record(record)?;
+        self.sync()
     }
 
     pub fn truncate(&mut self) -> Result<()> {
@@ -161,32 +170,57 @@ impl WalWriter {
     }
 }
 
+pub struct WalRecovery {
+    pub records: Vec<WalRecord>,
+    pub valid_len: u64,
+}
+
 pub struct WalReader {
     reader: BufReader<File>,
+    file_len: u64,
 }
 
 impl WalReader {
     pub fn open(path: &Path) -> Result<Self> {
         let file = File::open(path)?;
+        let file_len = file.metadata()?.len();
         Ok(Self {
             reader: BufReader::new(file),
+            file_len,
         })
     }
 
     pub fn read_all(&mut self) -> Result<Vec<WalRecord>> {
+        Ok(self.read_records(false)?.records)
+    }
+
+    pub fn recover(&mut self) -> Result<WalRecovery> {
+        self.read_records(true)
+    }
+
+    fn read_records(&mut self, tolerate_torn_tail: bool) -> Result<WalRecovery> {
         let mut records = Vec::new();
-        let mut len_buf = [0u8; 4];
+        let mut valid_len = 0u64;
 
         loop {
-            match self.reader.read_exact(&mut len_buf) {
-                Ok(()) => {}
-                Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => break,
-                Err(e) => return Err(e.into()),
+            let mut len_buf = [0u8; 4];
+            let filled = self.read_len_prefix(&mut len_buf)?;
+            if filled == 0 {
+                break;
+            }
+            if filled < len_buf.len() {
+                return self.stop_at_tail(records, valid_len, tolerate_torn_tail);
             }
 
             let total_len = u32::from_le_bytes(len_buf) as usize;
             if total_len < 9 {
+                if tolerate_torn_tail {
+                    return Ok(WalRecovery { records, valid_len });
+                }
                 break;
+            }
+            if valid_len + 8 + total_len as u64 > self.file_len {
+                return self.stop_at_tail(records, valid_len, tolerate_torn_tail);
             }
 
             let mut payload = vec![0u8; 4 + total_len + 4];
@@ -194,7 +228,7 @@ impl WalReader {
             match self.reader.read_exact(&mut payload[4..]) {
                 Ok(()) => {}
                 Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => {
-                    return Err(PebbleError::WalIncomplete);
+                    return self.stop_at_tail(records, valid_len, tolerate_torn_tail);
                 }
                 Err(e) => return Err(e.into()),
             }
@@ -212,9 +246,35 @@ impl WalReader {
 
             let record = WalRecord::decode(record_bytes)?;
             records.push(record);
+            valid_len += 8 + total_len as u64;
         }
 
-        Ok(records)
+        Ok(WalRecovery { records, valid_len })
+    }
+
+    fn read_len_prefix(&mut self, buf: &mut [u8; 4]) -> Result<usize> {
+        let mut filled = 0;
+        while filled < buf.len() {
+            let read = self.reader.read(&mut buf[filled..])?;
+            if read == 0 {
+                break;
+            }
+            filled += read;
+        }
+        Ok(filled)
+    }
+
+    fn stop_at_tail(
+        &self,
+        records: Vec<WalRecord>,
+        valid_len: u64,
+        tolerate_torn_tail: bool,
+    ) -> Result<WalRecovery> {
+        if tolerate_torn_tail {
+            Ok(WalRecovery { records, valid_len })
+        } else {
+            Err(PebbleError::WalIncomplete)
+        }
     }
 }
 
@@ -353,5 +413,137 @@ mod tests {
         let mut reader = WalReader::open(&path).unwrap();
         let records = reader.read_all().unwrap();
         assert_eq!(records.len(), 0);
+    }
+
+    #[test]
+    fn test_recover_discards_torn_final_record() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("wal.log");
+
+        let mut writer = WalWriter::open(&path).unwrap();
+        writer
+            .write_record(&WalRecord::Set {
+                key: "key1".into(),
+                value: "value1".into(),
+            })
+            .unwrap();
+        writer.close().unwrap();
+
+        let complete_len = fs::metadata(&path).unwrap().len();
+        let mut file = fs::OpenOptions::new().append(true).open(&path).unwrap();
+        file.write_all(&[40, 0, 0, 0, 1, 2, 3]).unwrap();
+        drop(file);
+
+        let mut reader = WalReader::open(&path).unwrap();
+        let recovery = reader.recover().unwrap();
+        assert_eq!(recovery.records.len(), 1);
+        assert_eq!(recovery.valid_len, complete_len);
+
+        assert!(matches!(
+            WalReader::open(&path).unwrap().read_all(),
+            Err(PebbleError::WalIncomplete)
+        ));
+    }
+
+    #[test]
+    fn test_recover_discards_partial_record_payload() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("wal.log");
+
+        let mut writer = WalWriter::open(&path).unwrap();
+        writer
+            .write_record(&WalRecord::Delete { key: "gone".into() })
+            .unwrap();
+        writer.close().unwrap();
+
+        let complete_len = fs::metadata(&path).unwrap().len();
+        let mut file = fs::OpenOptions::new().append(true).open(&path).unwrap();
+        file.write_all(&[100, 0, 0, 0, 1]).unwrap();
+        drop(file);
+
+        let recovery = WalReader::open(&path).unwrap().recover().unwrap();
+        assert_eq!(
+            recovery.records,
+            vec![WalRecord::Delete { key: "gone".into() }]
+        );
+        assert_eq!(recovery.valid_len, complete_len);
+    }
+
+    #[test]
+    fn test_recover_rejects_checksum_corruption() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("wal.log");
+
+        let mut writer = WalWriter::open(&path).unwrap();
+        writer
+            .write_record(&WalRecord::Set {
+                key: "key1".into(),
+                value: "value1".into(),
+            })
+            .unwrap();
+        writer
+            .write_record(&WalRecord::Set {
+                key: "key2".into(),
+                value: "value2".into(),
+            })
+            .unwrap();
+        writer.close().unwrap();
+
+        let mut data = fs::read(&path).unwrap();
+        data[5] ^= 0xFF;
+        fs::write(&path, &data).unwrap();
+
+        let result = WalReader::open(&path).unwrap().recover();
+        assert!(matches!(result, Err(PebbleError::WalCorruption(_))));
+    }
+
+    #[test]
+    fn test_recover_rejects_corrupt_tail_with_valid_checksum_length() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("wal.log");
+
+        let mut writer = WalWriter::open(&path).unwrap();
+        writer
+            .write_record(&WalRecord::Set {
+                key: "key1".into(),
+                value: "value1".into(),
+            })
+            .unwrap();
+        writer.close().unwrap();
+
+        let mut file = fs::OpenOptions::new().append(true).open(&path).unwrap();
+        file.write_all(&[
+            18, 0, 0, 0, 1, 4, 0, 0, 0, 5, 0, 0, 0, b'g', b'a', b'r', b'b', b'v', b'a', b'l', b'u',
+            b'e', 0, 0, 0, 0,
+        ])
+        .unwrap();
+        drop(file);
+
+        let result = WalReader::open(&path).unwrap().recover();
+        assert!(matches!(result, Err(PebbleError::WalCorruption(_))));
+    }
+
+    #[test]
+    fn test_recover_stops_at_garbage_tail_shorter_than_a_record() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("wal.log");
+
+        let mut writer = WalWriter::open(&path).unwrap();
+        writer
+            .write_record(&WalRecord::Set {
+                key: "key1".into(),
+                value: "value1".into(),
+            })
+            .unwrap();
+        writer.close().unwrap();
+
+        let complete_len = fs::metadata(&path).unwrap().len();
+        let mut file = fs::OpenOptions::new().append(true).open(&path).unwrap();
+        file.write_all(&[0u8; 10]).unwrap();
+        drop(file);
+
+        let recovery = WalReader::open(&path).unwrap().recover().unwrap();
+        assert_eq!(recovery.records.len(), 1);
+        assert_eq!(recovery.valid_len, complete_len);
     }
 }
