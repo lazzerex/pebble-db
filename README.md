@@ -1,4 +1,8 @@
 # PebbleDB
+![Rust](https://img.shields.io/badge/rust-2024%20edition-DEA584?logo=rust&logoColor=white)
+![Zero dependencies](https://img.shields.io/badge/dependencies-zero-blue)
+![Architecture](https://img.shields.io/badge/architecture-LSM--tree-orange)
+![Version](https://img.shields.io/badge/version-0.1.0-green)
 
 A small educational persistent key-value database written in Rust.
 
